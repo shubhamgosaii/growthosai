@@ -2,12 +2,11 @@ import express from "express";
 import cors from "cors";
 import admin from "firebase-admin";
 import dotenv from "dotenv";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
-/* ================= FIREBASE INIT ================= */
-
+//firebase init
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
@@ -18,28 +17,22 @@ admin.initializeApp({
 const rtdb = admin.database();
 const firestore = admin.firestore();
 
-/* ================= AI INIT ================= */
+//generative ai init
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const genAI = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY
-});
-
-/* ================= APP ================= */
-
+//App init
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* =================================================
-   FETCH FULL COMPANY DATA (AI USE)
-================================================= */
-
+// function to get all company data
 const getCompanyData = async () => {
-  const [users, attendance, leaves, alerts] = await Promise.all([
+  const [users, attendance, leaves, alerts, aiConfig] = await Promise.all([
     rtdb.ref("users").once("value"),
     rtdb.ref("attendance").once("value"),
     rtdb.ref("leaves").once("value"),
-    rtdb.ref("aiAlerts").once("value")
+    rtdb.ref("aiAlerts").once("value"),
+    rtdb.ref("aiConfig").once("value")
   ]);
 
   const performance = await firestore.collection("performance").get();
@@ -51,16 +44,14 @@ const getCompanyData = async () => {
     attendance: attendance.val() || {},
     leaves: leaves.val() || {},
     alerts: alerts.val() || {},
+    aiConfig: aiConfig.val() || { autoRun: false },
     performance: performance.docs.map(d => d.data()),
     sales: sales.docs.map(d => d.data()),
     projects: projects.docs.map(d => d.data())
   };
 };
 
-/* =================================================
-   METRICS CALCULATION
-================================================= */
-
+// function to calculate key metrics
 const calculateMetrics = (data) => {
   const users = Object.values(data.users || {});
   const employees = users.filter(u => u.role === "EMPLOYEE");
@@ -74,17 +65,60 @@ const calculateMetrics = (data) => {
   return {
     totalEmployees: employees.length,
     departmentWise,
-    attendanceRecords: Object.keys(data.attendance || {}).length,
+    attendanceCount: Object.keys(data.attendance || {}).length,
     leaveRequests: Object.keys(data.leaves || {}).length,
     projects: data.projects.length,
     totalSales: data.sales.reduce((s, x) => s + (x.amount || 0), 0)
   };
 };
 
-/* =================================================
-   HR: CREATE EMPLOYEE (FULL DETAILS)
-================================================= */
+//ai intent detection
+const detectIntent = (prompt = "") => {
+  const p = prompt.toLowerCase();
 
+  if (p.includes("attendance")) return "ATTENDANCE";
+  if (p.includes("leave")) return "LEAVE";
+  if (p.includes("employee") || p.includes("staff")) return "EMPLOYEE";
+  if (p.includes("performance")) return "PERFORMANCE";
+  if (p.includes("sales") || p.includes("revenue")) return "SALES";
+  if (p.includes("project")) return "PROJECT";
+  if (p.includes("risk")) return "RISK";
+  if (p.includes("growth")) return "GROWTH";
+
+  return "GENERAL";
+};
+
+// function to pick relevant data based on intent
+const pickRelevantData = (intent, data) => {
+  switch (intent) {
+    case "EMPLOYEE":
+      return { users: data.users };
+
+    case "ATTENDANCE":
+      return { attendance: data.attendance, users: data.users };
+
+    case "LEAVE":
+      return { leaves: data.leaves, users: data.users };
+
+    case "PERFORMANCE":
+      return { performance: data.performance };
+
+    case "SALES":
+      return { sales: data.sales };
+
+    case "PROJECT":
+      return { projects: data.projects };
+
+    case "RISK":
+    case "GROWTH":
+      return data;
+
+    default:
+      return data;
+  }
+};
+
+// create employee endpoint
 app.post("/create-employee", async (req, res) => {
   try {
     const {
@@ -118,10 +152,7 @@ app.post("/create-employee", async (req, res) => {
   }
 });
 
-/* =================================================
-   EMPLOYEE: ATTENDANCE MARK
-================================================= */
-
+// attendance marking
 app.post("/attendance/mark", async (req, res) => {
   try {
     const { uid } = req.body;
@@ -130,7 +161,8 @@ app.post("/attendance/mark", async (req, res) => {
     await rtdb.ref(`attendance/${uid}/${date}`).set({
       uid,
       date,
-      time: Date.now()
+      time: Date.now(),
+      status: "PRESENT"
     });
 
     res.json({ success: true });
@@ -139,10 +171,7 @@ app.post("/attendance/mark", async (req, res) => {
   }
 });
 
-/* =================================================
-   EMPLOYEE: LEAVE REQUEST
-================================================= */
-
+// leave request
 app.post("/leave/request", async (req, res) => {
   try {
     const { uid, from, to, reason } = req.body;
@@ -163,10 +192,7 @@ app.post("/leave/request", async (req, res) => {
   }
 });
 
-/* =================================================
-   HR: LEAVE APPROVE / REJECT
-================================================= */
-
+// leave action (approve/reject)
 app.post("/leave/action", async (req, res) => {
   try {
     const { leaveId, status } = req.body;
@@ -177,94 +203,84 @@ app.post("/leave/action", async (req, res) => {
   }
 });
 
-/* =================================================
-   AI: MANUAL QUERY (CHAT)
-================================================= */
-
+// ai query endpoint
 app.post("/ai/query", async (req, res) => {
   try {
     const { prompt } = req.body;
 
-    const data = await getCompanyData();
-    const metrics = calculateMetrics(data);
+    const fullData = await getCompanyData();
+    const intent = detectIntent(prompt);
+    const relevantData = pickRelevantData(intent, fullData);
+    const metrics = calculateMetrics(fullData);
 
-    const response = await genAI.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: `
-You are GrowthOS AI – an AI Operating System for companies.
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+    const result = await model.generateContent(`
+You are GrowthOS AI – a real company operating system.
 
 RULES:
-- Respond ONLY in plain English
+- Plain English only
 - No JSON
-- No code blocks
+- No code
+- Answer ONLY what is asked
+
+Intent: ${intent}
 
 Company Metrics:
 ${JSON.stringify(metrics)}
 
-Company Data:
-${JSON.stringify(data)}
+Relevant Data:
+${JSON.stringify(relevantData)}
 
 User Question:
 ${prompt}
 
-Analyze deeply, find risks, growth opportunities and give clear action steps.
-`
-            }
-          ]
-        }
-      ]
+Give:
+1. Direct answer
+2. Data based reasoning
+3. Risk (if any)
+4. Clear actions
+`);
+
+    const reply = result.response.text();
+
+    await rtdb.ref("aiInsights").push({
+      prompt,
+      intent,
+      reply,
+      createdAt: Date.now()
     });
 
-    const insight = {
-      prompt,
-      reply: response.text,
-      metrics,
-      createdAt: Date.now()
-    };
-
-    await rtdb.ref("aiInsights").push(insight);
-
-    res.json({ reply: response.text });
+    res.json({ reply });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-/* =================================================
-   AI: AUTO RISK MONITOR (CRON / MANUAL)
-================================================= */
-
+//ai auto-run endpoint
 app.post("/ai/auto-run", async (_, res) => {
   try {
     const data = await getCompanyData();
+    if (!data.aiConfig.autoRun) {
+      return res.json({ success: false, message: "Auto AI disabled" });
+    }
+
     const metrics = calculateMetrics(data);
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
-    const response = await genAI.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: `
-You are GrowthOS AI running autonomous monitoring.
+    const result = await model.generateContent(`
+You are GrowthOS AI running autonomously.
 
-Analyze company health, detect risks, inefficiencies
-and generate critical alerts for HR and management.
-`
-            }
-          ]
-        }
-      ]
-    });
+Analyze company health and detect:
+- HR risks
+- Operational risks
+- Growth bottlenecks
+
+Give urgent alerts.
+`);
 
     await rtdb.ref("aiAlerts").push({
-      message: response.text,
+      message: result.response.text(),
       metrics,
       createdAt: Date.now()
     });
@@ -275,15 +291,12 @@ and generate critical alerts for HR and management.
   }
 });
 
-/* =================================================
-   SERVER
-================================================= */
-
+// start server
 app.get("/", (_, res) => {
-  res.send("✅ GrowthOS AI Backend Running");
+  res.send("GrowthOS AI Backend Running");
 });
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () =>
-  console.log("🚀 GrowthOS AI running on port", PORT)
+  console.log("GrowthOS AI running on port", PORT)
 );
