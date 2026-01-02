@@ -257,39 +257,7 @@ Give:
   }
 });
 
-//ai auto-run endpoint
-app.post("/ai/auto-run", async (_, res) => {
-  try {
-    const data = await getCompanyData();
-    if (!data.aiConfig.autoRun) {
-      return res.json({ success: false, message: "Auto AI disabled" });
-    }
 
-    const metrics = calculateMetrics(data);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-
-    const result = await model.generateContent(`
-You are GrowthOS AI running autonomously.
-
-Analyze company health and detect:
-- HR risks
-- Operational risks
-- Growth bottlenecks
-
-Give urgent alerts.
-`);
-
-    await rtdb.ref("aiAlerts").push({
-      message: result.response.text(),
-      metrics,
-      createdAt: Date.now()
-    });
-
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // start server
 app.get("/", (_, res) => {
