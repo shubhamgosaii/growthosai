@@ -51,26 +51,6 @@ const getCompanyData = async () => {
   };
 };
 
-// function to calculate key metrics
-const calculateMetrics = (data) => {
-  const users = Object.values(data.users || {});
-  const employees = users.filter(u => u.role === "EMPLOYEE");
-
-  const departmentWise = {};
-  employees.forEach(e => {
-    departmentWise[e.department] =
-      (departmentWise[e.department] || 0) + 1;
-  });
-
-  return {
-    totalEmployees: employees.length,
-    departmentWise,
-    attendanceCount: Object.keys(data.attendance || {}).length,
-    leaveRequests: Object.keys(data.leaves || {}).length,
-    projects: data.projects.length,
-    totalSales: data.sales.reduce((s, x) => s + (x.amount || 0), 0)
-  };
-};
 
 //ai intent detection
 const detectIntent = (prompt = "") => {
