@@ -6,7 +6,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
-//firebase init
+// firebase admin init
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
@@ -15,134 +15,147 @@ admin.initializeApp({
 });
 
 const rtdb = admin.database();
-const firestore = admin.firestore();
 
-//generative ai init
+// ai init
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-//App init
+// app init
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// function to get all company data
+// fetch company data
 const getCompanyData = async () => {
-  const [users, attendance, leaves, alerts, aiConfig] = await Promise.all([
+  const [usersSnap, attendanceSnap, leavesSnap] = await Promise.all([
     rtdb.ref("users").once("value"),
     rtdb.ref("attendance").once("value"),
-    rtdb.ref("leaves").once("value"),
-    rtdb.ref("aiAlerts").once("value"),
-    rtdb.ref("aiConfig").once("value")
+    rtdb.ref("leaves").once("value")
   ]);
 
-  const performance = await firestore.collection("performance").get();
-  const sales = await firestore.collection("sales").get();
-  const projects = await firestore.collection("projects").get();
-
   return {
-    users: users.val() || {},
-    attendance: attendance.val() || {},
-    leaves: leaves.val() || {},
-    alerts: alerts.val() || {},
-    aiConfig: aiConfig.val() || { autoRun: false },
-    performance: performance.docs.map(d => d.data()),
-    sales: sales.docs.map(d => d.data()),
-    projects: projects.docs.map(d => d.data())
+    users: usersSnap.val() || {},
+    attendance: attendanceSnap.val() || {},
+    leaves: leavesSnap.val() || {}
   };
 };
 
+// calculate basic metrics
+const calculateMetrics = (data) => {
+  const users = Object.values(data.users || {});
+  const employees = users.filter(u => u.role === "EMPLOYEE");
 
-//ai intent detection
-const detectIntent = (prompt = "") => {
-  const p = prompt.toLowerCase();
+  const departmentWise = {};
+  employees.forEach(e => {
+    departmentWise[e.department] =
+      (departmentWise[e.department] || 0) + 1;
+  });
 
-  if (p.includes("attendance")) return "ATTENDANCE";
-  if (p.includes("leave")) return "LEAVE";
-  if (p.includes("employee") || p.includes("staff")) return "EMPLOYEE";
-  if (p.includes("performance")) return "PERFORMANCE";
-  if (p.includes("sales") || p.includes("revenue")) return "SALES";
-  if (p.includes("project")) return "PROJECT";
-  if (p.includes("risk")) return "RISK";
-  if (p.includes("growth")) return "GROWTH";
-
-  return "GENERAL";
+  return {
+    totalEmployees: employees.length,
+    departmentWise
+  };
 };
 
-// function to pick relevant data based on intent
-const pickRelevantData = (intent, data) => {
-  switch (intent) {
-    case "EMPLOYEE":
-      return { users: data.users };
+// ai query endpoint
+app.post("/ai/query", async (req, res) => {
+  try {
+    const { prompt, mode = "BOTH" } = req.body;
 
-    case "ATTENDANCE":
-      return { attendance: data.attendance, users: data.users };
+    if (!prompt) {
+      return res.json({ reply: "Please ask a question." });
+    }
 
-    case "LEAVE":
-      return { leaves: data.leaves, users: data.users };
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash"
+    });
 
-    case "PERFORMANCE":
-      return { performance: data.performance };
+   // just jarvis (company ai)
+    if (mode === "JARVIS") {
+      const data = await getCompanyData();
+      const metrics = calculateMetrics(data);
 
-    case "SALES":
-      return { sales: data.sales };
+      const result = await model.generateContent(`
+You are GrowthOS Jarvis (Company AI).
 
-    case "PROJECT":
-      return { projects: data.projects };
+RULES:
+- Answer ONLY from company data
+- Be short & precise
+- No assumptions
+- No extra info
 
-    case "RISK":
-    case "GROWTH":
-      return data;
+Company Metrics:
+${JSON.stringify(metrics)}
 
-    default:
-      return data;
+Company Data:
+${JSON.stringify(data)}
+
+Question:
+${prompt}
+`);
+
+      return res.json({ reply: result.response.text() });
+    }
+
+    // just gemini (general ai)
+    if (mode === "GEMI") {
+      const result = await model.generateContent(`
+You are Gemini AI.
+
+Answer clearly and professionally.
+
+Question:
+${prompt}
+`);
+      return res.json({ reply: result.response.text() });
+    }
+
+    // hybrid (both)
+    const data = await getCompanyData();
+    const metrics = calculateMetrics(data);
+
+    const result = await model.generateContent(`
+You are GrowthOS AI (Hybrid).
+
+RULES:
+- Prefer company data if relevant
+- Otherwise use general knowledge
+- Clear, structured answer
+
+Company Metrics:
+${JSON.stringify(metrics)}
+
+Company Data:
+${JSON.stringify(data)}
+
+Question:
+${prompt}
+`);
+
+    return res.json({ reply: result.response.text() });
+
+  } catch (error) {
+    console.error("AI ERROR:", error);
+    res.status(500).json({
+      reply: "AI failed while analyzing the request."
+    });
   }
-};
+});
 
 // create employee endpoint
 app.post("/create-employee", async (req, res) => {
   try {
-    const {
-      fullName,
-      email,
-      password,
-      dob,
-      skills,
-      role,
-      department,
-      hrUid
-    } = req.body;
+    const { fullName, email, password, department, hrUid } = req.body;
 
     const user = await admin.auth().createUser({ email, password });
 
     await rtdb.ref(`users/${user.uid}`).set({
       fullName,
       email,
-      dob,
-      skills,
-      role,
       department,
+      role: "EMPLOYEE",
       status: "ACTIVE",
       createdBy: hrUid,
       createdAt: Date.now()
-    });
-
-    res.json({ success: true, uid: user.uid });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// attendance marking
-app.post("/attendance/mark", async (req, res) => {
-  try {
-    const { uid } = req.body;
-    const date = new Date().toISOString().split("T")[0];
-
-    await rtdb.ref(`attendance/${uid}/${date}`).set({
-      uid,
-      date,
-      time: Date.now(),
-      status: "PRESENT"
     });
 
     res.json({ success: true });
@@ -151,7 +164,26 @@ app.post("/attendance/mark", async (req, res) => {
   }
 });
 
-// leave request
+// mark attendance endpoint
+app.post("/attendance/mark", async (req, res) => {
+  try {
+    const { uid } = req.body;
+    const date = new Date().toISOString().split("T")[0];
+
+    await rtdb.ref(`attendance/${uid}/${date}`).set({
+      uid,
+      date,
+      status: "PRESENT",
+      time: Date.now()
+    });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// leave request endpoint
 app.post("/leave/request", async (req, res) => {
   try {
     const { uid, from, to, reason } = req.body;
@@ -172,7 +204,7 @@ app.post("/leave/request", async (req, res) => {
   }
 });
 
-// leave action (approve/reject)
+// leave action endpoint
 app.post("/leave/action", async (req, res) => {
   try {
     const { leaveId, status } = req.body;
@@ -182,62 +214,6 @@ app.post("/leave/action", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
-// ai query endpoint
-app.post("/ai/query", async (req, res) => {
-  try {
-    const { prompt } = req.body;
-
-    const fullData = await getCompanyData();
-    const intent = detectIntent(prompt);
-    const relevantData = pickRelevantData(intent, fullData);
-    const metrics = calculateMetrics(fullData);
-
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-
-    const result = await model.generateContent(`
-You are GrowthOS AI – a real company operating system.
-
-RULES:
-- Plain English only
-- No JSON
-- No code
-- Answer ONLY what is asked
-
-Intent: ${intent}
-
-Company Metrics:
-${JSON.stringify(metrics)}
-
-Relevant Data:
-${JSON.stringify(relevantData)}
-
-User Question:
-${prompt}
-
-Give:
-1. Direct answer
-2. Data based reasoning
-3. Risk (if any)
-4. Clear actions
-`);
-
-    const reply = result.response.text();
-
-    await rtdb.ref("aiInsights").push({
-      prompt,
-      intent,
-      reply,
-      createdAt: Date.now()
-    });
-
-    res.json({ reply });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
 
 // start server
 app.get("/", (_, res) => {
