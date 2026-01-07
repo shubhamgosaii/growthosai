@@ -6,168 +6,234 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
-// firebase admin init
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+/* ================= FIREBASE INIT ================= */
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+  throw new Error("FIREBASE_SERVICE_ACCOUNT missing");
+}
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+  credential: admin.credential.cert(
+    JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+  ),
   databaseURL: process.env.FIREBASE_DATABASE_URL
 });
 
 const rtdb = admin.database();
 
-// ai init
+/* ================= AI INIT ================= */
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// app init
+/* ================= APP INIT ================= */
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// fetch company data
+/* ================= HELPERS ================= */
+const safeKey = (v) => {
+  if (!v || typeof v !== "string") return null;
+  return v.trim();
+};
+
+/* ================= AI HELPERS ================= */
 const getCompanyData = async () => {
-  const [usersSnap, attendanceSnap, leavesSnap] = await Promise.all([
-    rtdb.ref("users").once("value"),
+  const [departmentsSnap, attendanceSnap, leavesSnap] = await Promise.all([
+    rtdb.ref("departments").once("value"),
     rtdb.ref("attendance").once("value"),
     rtdb.ref("leaves").once("value")
   ]);
 
   return {
-    users: usersSnap.val() || {},
+    departments: departmentsSnap.val() || {},
     attendance: attendanceSnap.val() || {},
     leaves: leavesSnap.val() || {}
   };
 };
 
-// calculate basic metrics
 const calculateMetrics = (data) => {
-  const users = Object.values(data.users || {});
-  const employees = users.filter(u => u.role === "EMPLOYEE");
-
+  let totalEmployees = 0;
   const departmentWise = {};
-  employees.forEach(e => {
-    departmentWise[e.department] =
-      (departmentWise[e.department] || 0) + 1;
+
+  Object.entries(data.departments || {}).forEach(([dept, users]) => {
+    const count = Object.keys(users || {}).length;
+    departmentWise[dept] = count;
+    totalEmployees += count;
   });
 
-  return {
-    totalEmployees: employees.length,
-    departmentWise
-  };
+  return { totalEmployees, departmentWise };
 };
 
-// ai query endpoint
+/* ================= AI QUERY ================= */
 app.post("/ai/query", async (req, res) => {
   try {
-    const { prompt, mode = "BOTH" } = req.body;
-
+    const { prompt } = req.body;
     if (!prompt) {
-      return res.json({ reply: "Please ask a question." });
+      return res.status(400).json({ reply: "Prompt required" });
     }
 
     const model = genAI.getGenerativeModel({
       model: "gemini-2.5-flash"
     });
 
-   // just jarvis (company ai)
-    if (mode === "JARVIS") {
-      const data = await getCompanyData();
-      const metrics = calculateMetrics(data);
-
-      const result = await model.generateContent(`
-You are GrowthOS Jarvis (Company AI).
-
-RULES:
-- Answer ONLY from company data
-- Be short & precise
-- No assumptions
-- No extra info
-
-Company Metrics:
-${JSON.stringify(metrics)}
-
-Company Data:
-${JSON.stringify(data)}
-
-Question:
-${prompt}
-`);
-
-      return res.json({ reply: result.response.text() });
-    }
-
-    // just gemini (general ai)
-    if (mode === "GEMI") {
-      const result = await model.generateContent(`
-You are Gemini AI.
-
-Answer clearly and professionally.
-
-Question:
-${prompt}
-`);
-      return res.json({ reply: result.response.text() });
-    }
-
-    // hybrid (both)
     const data = await getCompanyData();
     const metrics = calculateMetrics(data);
 
     const result = await model.generateContent(`
-You are GrowthOS AI (Hybrid).
+You are GrowthOS AI.
 
-RULES:
-- Prefer company data if relevant
-- Otherwise use general knowledge
-- Clear, structured answer
+Rules:
+- Use company data only
+- Short & clear answers
 
-Company Metrics:
+Metrics:
 ${JSON.stringify(metrics)}
 
-Company Data:
+Data:
 ${JSON.stringify(data)}
 
 Question:
 ${prompt}
 `);
 
-    return res.json({ reply: result.response.text() });
-
-  } catch (error) {
-    console.error("AI ERROR:", error);
-    res.status(500).json({
-      reply: "AI failed while analyzing the request."
-    });
+    res.json({ reply: result.response.text() });
+  } catch (e) {
+    console.error("AI ERROR:", e);
+    res.status(500).json({ reply: "AI failed" });
   }
 });
 
-// create employee endpoint
+/* ================= CREATE EMPLOYEE / HR ================= */
 app.post("/create-employee", async (req, res) => {
   try {
-    const { fullName, email, password, department, hrUid } = req.body;
+    let { fullName, email, password, department, role, createdBy } = req.body;
+
+    department = safeKey(department);
+
+    if (!fullName || !email || !password || !department || !role) {
+      return res.status(400).json({
+        error: "fullName, email, password, department & role are required"
+      });
+    }
 
     const user = await admin.auth().createUser({ email, password });
 
-    await rtdb.ref(`users/${user.uid}`).set({
+    await rtdb.ref(`departments/${department}/${user.uid}`).set({
+      uid: user.uid,
       fullName,
       email,
-      department,
-      role: "EMPLOYEE",
+      role,
+      accountType: department === "HR Department" ? "HR" : "EMPLOYEE",
       status: "ACTIVE",
-      createdBy: hrUid,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      createdBy: createdBy || null
     });
 
-    res.json({ success: true });
+    res.json({ success: true, uid: user.uid });
   } catch (e) {
+    console.error("CREATE USER ERROR:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// mark attendance endpoint
+
+// =======================================================
+// 🔥 LOGIN + VERIFY (NO UID FROM FRONTEND)
+// frontend → email + department + role
+// backend → uid find + verify + dashboard decide
+// =======================================================
+
+app.post("/auth/verify-login", async (req, res) => {
+  try {
+    let { email, department, role } = req.body;
+
+    email = safeKey(email);
+    department = safeKey(department);
+    role = safeKey(role);
+
+    if (!email || !department || !role) {
+      return res.json({
+        authorized: false,
+        reason: "Missing login data"
+      });
+    }
+
+    // 🔍 get department users
+    const deptSnap = await rtdb
+      .ref(`departments/${department}`)
+      .once("value");
+
+    if (!deptSnap.exists()) {
+      return res.json({
+        authorized: false,
+        reason: "Department not found"
+      });
+    }
+
+    let foundUser = null;
+    let foundUid = null;
+
+    // 🔍 find user by email
+    deptSnap.forEach(child => {
+      const user = child.val();
+      if (user.email === email) {
+        foundUser = user;
+        foundUid = child.key;
+      }
+    });
+
+    if (!foundUser) {
+      return res.json({
+        authorized: false,
+        reason: "User not found in department"
+      });
+    }
+
+    // 🔐 role check
+    if (foundUser.role !== role) {
+      return res.json({
+        authorized: false,
+        reason: "Role mismatch"
+      });
+    }
+
+    // 🔐 status check
+    if (foundUser.status !== "ACTIVE") {
+      return res.json({
+        authorized: false,
+        reason: "User inactive"
+      });
+    }
+
+    // 🧭 backend decides dashboard
+    let dashboard = "/employee/dashboard";
+    if (foundUser.accountType === "HR") {
+      dashboard = "/hr/dashboard";
+    }
+
+    return res.json({
+      authorized: true,
+      uid: foundUid,
+      department,
+      role,
+      dashboard
+    });
+
+  } catch (e) {
+    console.error("VERIFY LOGIN ERROR:", e);
+    res.status(500).json({
+      authorized: false,
+      reason: "Server error"
+    });
+  }
+});
+
+/* ================= ATTENDANCE ================= */
 app.post("/attendance/mark", async (req, res) => {
   try {
     const { uid } = req.body;
+    if (!uid) {
+      return res.status(400).json({ error: "uid required" });
+    }
+
     const date = new Date().toISOString().split("T")[0];
 
     await rtdb.ref(`attendance/${uid}/${date}`).set({
@@ -183,10 +249,15 @@ app.post("/attendance/mark", async (req, res) => {
   }
 });
 
-// leave request endpoint
+/* ================= LEAVES ================= */
 app.post("/leave/request", async (req, res) => {
   try {
     const { uid, from, to, reason } = req.body;
+
+    if (!uid || !from || !to || !reason) {
+      return res.status(400).json({ error: "Invalid leave data" });
+    }
+
     const id = rtdb.ref("leaves").push().key;
 
     await rtdb.ref(`leaves/${id}`).set({
@@ -204,10 +275,14 @@ app.post("/leave/request", async (req, res) => {
   }
 });
 
-// leave action endpoint
 app.post("/leave/action", async (req, res) => {
   try {
     const { leaveId, status } = req.body;
+
+    if (!leaveId || !status) {
+      return res.status(400).json({ error: "leaveId & status required" });
+    }
+
     await rtdb.ref(`leaves/${leaveId}/status`).set(status);
     res.json({ success: true });
   } catch (e) {
@@ -215,7 +290,7 @@ app.post("/leave/action", async (req, res) => {
   }
 });
 
-// start server
+/* ================= SERVER ================= */
 app.get("/", (_, res) => {
   res.send("GrowthOS AI Backend Running");
 });
